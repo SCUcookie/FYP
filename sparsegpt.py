@@ -29,6 +29,7 @@ class SparseGPT:
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
+
     def add_batch(self, inp, out, blocksize=1024):
         if DEBUG:
             self.inp1 = inp
@@ -86,6 +87,47 @@ class SparseGPT:
 
         mask = None
 
+        def get_block_sensitivity(W_block, Hinv_block):
+            """计算子块敏感度得分"""
+            # 公式：salience = sum(w^2 / (Hinv_diag^2)) 
+            return torch.sum(W_block**2 / torch.diag(Hinv_block).reshape(1,-1)**2)
+
+        # ===== 动态N:M分配 =====
+        def assign_nm_pattern(salience_list, M=8):
+            """根据敏感度排名分配N值"""
+            sorted_indices = torch.argsort(torch.tensor(salience_list), descending=True)
+            n_values = []
+            for idx in sorted_indices:
+                if idx < len(salience_list)*0.2:  # 前30%高敏感块
+                    n_values.append(3)            # 5:8
+                elif idx < len(salience_list)*0.8:# 中间40%
+                    n_values.append(4)            # 4:8 
+                else:                             # 后30%
+                    n_values.append(5)            # 3:8
+            return n_values
+        
+        # ===== 修改剪枝循环 =====
+        all_saliences = []
+        block_Hinvs = []
+        
+        # 首次遍历：计算所有块的敏感度
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            Hinv1 = Hinv[i1:i2, i1:i2]
+            W1 = W[:, i1:i2].clone()
+            
+            # 将大块进一步划分为8x8子块
+            for sub_i in range(0, W1.shape[1], 8):
+                sub_block = W1[:, sub_i:sub_i+8]
+                Hinv_sub = Hinv1[sub_i:sub_i+8, sub_i:sub_i+8]
+                all_saliences.append(get_block_sensitivity(sub_block, Hinv_sub))
+                block_Hinvs.append(Hinv_sub)
+        
+        # 分配N值（3:8/4:8/5:8）            
+        n_values = assign_nm_pattern(all_saliences)
+        #print(f"n_values: {n_values}")
+        block_idx = 0
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -127,7 +169,8 @@ class SparseGPT:
 
                 if prunen != 0 and i % prunem == 0:    #n:m的半结构裁剪
                     tmp = W1[:, i:(i + prunem)] ** 2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1))) ** 2
-                    mask1.scatter_(1, i + torch.topk(tmp, prunen, dim=1, largest=False)[1], True)
+                    mask1.scatter_(1, i + torch.topk(tmp, n_values[block_idx], dim=1, largest=False)[1], True)
+                    block_idx+=1
 
                 q = w.clone()
                 q[mask1[:, i]] = 0
