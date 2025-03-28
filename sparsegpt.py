@@ -89,7 +89,6 @@ class SparseGPT:
 
         def get_block_sensitivity(W_block, Hinv_block):
             """计算子块敏感度得分"""
-            # 公式：salience = sum(w^2 / (Hinv_diag^2)) 
             return torch.sum(W_block**2 / torch.diag(Hinv_block).reshape(1,-1)**2)
 
         # ===== 动态N:M分配 =====
@@ -97,13 +96,21 @@ class SparseGPT:
             """根据敏感度排名分配N值"""
             sorted_indices = torch.argsort(torch.tensor(salience_list), descending=True)
             n_values = []
+            if sparsity<0.4:
+                three_eight = 0.4
+            elif sparsity<0.6:
+                three_eight = 0.15
+            else:
+                three_eight = 0.25
+            four_eight = 5 - 2*three_eight - 8*sparsity
+            five_eight = 1 - three_eight - four_eight
             for idx in sorted_indices:
-                if idx < len(salience_list)*0.2:  # 前30%高敏感块
-                    n_values.append(3)            # 5:8
-                elif idx < len(salience_list)*0.8:# 中间40%
-                    n_values.append(4)            # 4:8 
-                else:                             # 后30%
-                    n_values.append(5)            # 3:8
+                if idx < len(salience_list)*three_eight:
+                    n_values.append(3)
+                elif idx < len(salience_list)*(three_eight + four_eight):
+                    n_values.append(4)
+                else:
+                    n_values.append(5)
             return n_values
         
         # ===== 修改剪枝循环 =====
