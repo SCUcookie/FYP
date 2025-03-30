@@ -96,13 +96,13 @@ class SparseGPT:
             """根据敏感度排名分配N值"""
             sorted_indices = torch.argsort(torch.tensor(salience_list), descending=True)
             n_values = []
-            if sparsity<0.4:
-                three_eight = 0.4
-            elif sparsity<0.6:
-                three_eight = 0.15
+            if sparsity<=0.4:
+                four_eight = 0.25
+            elif sparsity<=0.6:
+                four_eight = 0.55
             else:
-                three_eight = 0.25
-            four_eight = 5 - 2*three_eight - 8*sparsity
+                four_eight = 0.4
+            three_eight = 2.5 - 0.5*four_eight - 4*sparsity
             five_eight = 1 - three_eight - four_eight
             for idx in sorted_indices:
                 if idx < len(salience_list)*three_eight:
