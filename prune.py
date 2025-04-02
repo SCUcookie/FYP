@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from quant import *
-from sparsegpt import *
+from obsprune import *
 from modelutils import *
 import bisect
 try:
@@ -27,6 +27,14 @@ def get_opt(model):
     return model
 
 dev=torch.device('cuda')
+
+def normalize_sensitivity(sensitivity):
+    # 将敏感度归一化到0-1区间
+    sen_tensor = torch.tensor(sensitivity)
+    min_val = sen_tensor.min()
+    max_val = sen_tensor.max()
+    normalized = (sen_tensor - min_val) / (max_val - min_val + 1e-8)
+    return normalized
 
 @torch.no_grad()
 def opt_sequential(model, dataloader, dev, method="pruning", sparsity_way="origin", sensitivity=None, total_weight=None):
@@ -73,10 +81,13 @@ def opt_sequential(model, dataloader, dev, method="pruning", sparsity_way="origi
 
     print('Ready.')
     print("Pruning ...")
-    
+
+    #print(layers)
+    first,third=0,0
+    id_list=[]
+    total_params, total_zeros = 0, 0
     for i in range(len(layers)):
         layer = layers[i].to(dev)
-
         subset = find_layers(layer)
         gpts = {}
         for name in subset:
@@ -137,9 +148,11 @@ def opt_sequential(model, dataloader, dev, method="pruning", sparsity_way="origi
                 sen = torch.softmax(sen, dim=-1) * num_layer * sparsity
             sen = torch.cat((sen, torch.ones(last_layer_num)), dim=-1)
             return 1 - sen[l]
+            
         def get_weight_sparsity(layer, name):
             id = bisect.bisect_left(total_weight, sensitivity[layer][name]) 
-            lower_bound = 0.25
+            id_list.append(id)
+            lower_bound = 0.4
             upper_bound = 2 * args.sparsity - lower_bound
             sen = lower_bound + id * (upper_bound - lower_bound) / (len(total_weight) - 1 )
             return 1-sen 
@@ -153,21 +166,25 @@ def opt_sequential(model, dataloader, dev, method="pruning", sparsity_way="origi
                     sparsity = get_layer_sparsity(i)
                 elif sparsity_way == "weight-level":
                     sparsity = get_weight_sparsity(i, name)
-                    if sparsity<=0.3:
-                        prunen=1
-                    elif sparsity<=0.7:
-                        prunen=2
-                    else:
+                    if sparsity<=0.4:
                         prunen=3
-                    prunem=4
+                        first+=1
+                    elif sparsity<=0.6:
+                        prunen=4
+                    else:
+                        prunen=5
+                        third+=1
                 gpts[name].fasterprune(
                     sparsity,
-                    prunen=prunen,
-                    prunem=prunem,
+                    prunen=4,
+                    prunem=8,
                     percdamp=args.percdamp,
                     blocksize=args.blocksize,
                 )
                 gpts[name].free()
+                weight_param = subset[name].weight.data
+                total_params += weight_param.numel()
+                total_zeros+=torch.sum(weight_param == 0).item()
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
@@ -177,7 +194,9 @@ def opt_sequential(model, dataloader, dev, method="pruning", sparsity_way="origi
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
-
+    print(first,third)
+    print(f"id_list:{id_list}{len(id_list)}")
+    print(f"sparse rate:{total_zeros/total_params}")
     model.config.use_cache = use_cache
 
 @torch.no_grad()
@@ -285,6 +304,31 @@ def opt_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     model.config.use_cache = use_cache
 
 
+def calculate_global_sparsity(model, args):
+    """统计模型中符合剪枝条件的权重矩阵的全局稀疏度"""
+    total_zeros = 0
+    total_params = 0
+
+    # 遍历所有被剪枝的Decoder层
+    for i, layer in enumerate(model.model.decoder.layers):
+        # 跳过不在[minlayer, maxlayer)范围内的层
+        if not (args.minlayer <= i < args.maxlayer):
+            continue
+        
+        # 查找当前层的可剪枝子模块（如fc1, fc2等）
+        subset = find_layers(layer)
+        for name in subset:
+            # 根据剪枝条件过滤（如只处理包含'fc'的层）
+            if (args.prune_only in name) == (not args.invert):
+                weight = subset[name].weight.data
+                zeros = torch.sum(weight == 0).item()
+                total_zeros += zeros
+                total_params += weight.numel()
+
+    if total_params == 0:
+        return 0.0  # 避免除零错误
+    return total_zeros / total_params
+
 if __name__ == '__main__':
     import argparse
     from datautils import *
@@ -381,15 +425,39 @@ if __name__ == '__main__':
     dataloader = [(inputs.to(dev), targets.to(dev)) for inputs, targets in dataloader]
     if (args.sparsity or args.prunen) and not args.gmp:
         tick = time.time()
-        from sensitivity import *
+        from sensitivity import get_sensitivity
         sensitivity,total_weight = get_sensitivity(model, dataloader, dev=torch.device('cuda'), sparsity_way=args.sparsity_way, args=args)
-        #print(sensitivity)
+
+        # filtered_sensitivity = []
+        # for layer_sensitivity in sensitivity:
+        #     filtered_layer_sensitivity = {k: v for k, v in layer_sensitivity.items() if any(x in k for x in ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.out_proj', 'fc1', 'fc2'])}
+        #     filtered_sensitivity.append(filtered_layer_sensitivity)
+
+        # # 过滤total_weight列表
+        # filtered_total_weight = []
+        # for weight in total_weight:
+        #     keep = False
+        #     for layer_sensitivity in sensitivity:
+        #         if weight in layer_sensitivity.values():
+        #             key = list(layer_sensitivity.keys())[list(layer_sensitivity.values()).index(weight)]
+        #             if any(x in key for x in ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.out_proj', 'fc1', 'fc2']):
+        #                 keep = True
+        #                 break
+        #     if keep:
+        #         filtered_total_weight.append(weight)
+
+        # # 更新sensitivity和total_weight
+        # sensitivity = filtered_sensitivity
+        # total_weight = filtered_total_weight
+
         opt_sequential(model, dataloader, dev, sparsity_way=args.sparsity_way, sensitivity=sensitivity,total_weight=total_weight)
         for n, p in model.named_parameters():
             print(n, torch.mean((p == 0).float()))
             if 'fc2' in n:
                 break
         print(time.time() - tick)
+        global_sparsity = calculate_global_sparsity(model, args)
+        print(f"[Global Sparsity] {global_sparsity*100:.2f}%")
     
     datalist = ['wikitext2', 'ptb', 'c4']
     for dataset in datalist:
