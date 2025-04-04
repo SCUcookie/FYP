@@ -160,10 +160,6 @@ class SparseGPT:
                     ### Our Saliency
                     else:
                         tmp = W1 ** 2 * (torch.diag(self.H[i1:i2,i1:i2]).reshape((1, -1)) + 1.0 / torch.diag(Hinv1).reshape((1, -1))) 
-                    #tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) 
-                    # import pdb
-                    # pdb.set_trace()
-                    #tmp = W1 ** 2 * (torch.diag(self.H[i1:i2,i1:i2]).reshape((1, -1))) 
                     
                     thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
                     mask1 = tmp <= thresh #得到哪些位置应该被mask
