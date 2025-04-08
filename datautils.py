@@ -3,6 +3,7 @@ import random
 import numpy as np
 import torch
 from datasets import load_dataset
+from datasets import load_from_disk
 from transformers import AutoTokenizer, LlamaTokenizer
 
 
@@ -30,6 +31,24 @@ def get_wikitext2(nsamples, seed, seqlen, model, tokenizer):
 
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+
+    random.seed(seed)
+    trainloader = []
+    for _ in range(nsamples):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+    return trainloader, testenc
+
+def get_ptb(nsamples, seed, seqlen, model, tokenizer):
+    traindata = load_from_disk('ptb/train')
+    testdata = load_from_disk('ptb/test')
+
+    trainenc = tokenizer(" ".join(traindata['sentence']), return_tensors='pt')
+    testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
 
     random.seed(seed)
     trainloader = []
