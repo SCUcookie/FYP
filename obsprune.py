@@ -51,6 +51,47 @@ class SparseGPT:
         
         self.H += inp.matmul(inp.t())
 
+    def unstructured_prune(self, sparsity, blocksize=128, percdamp=0.01):
+        # 保存原始权重
+        W_orig = self.layer.weight.data.clone()
+        W = W_orig.clone().float()
+        
+        # 执行标准OBS剪枝流程
+        H = self.H.clone()
+        dead = torch.diag(H) == 0
+        H[dead, dead] = 1
+        W[:, dead] = 0
+        
+        damp = percdamp * torch.mean(torch.diag(H))
+        diag = torch.arange(self.columns, device=self.dev)
+        H[diag, diag] += damp
+        
+        H = torch.linalg.cholesky(H)
+        H = torch.cholesky_inverse(H)
+        Hinv = torch.linalg.cholesky(H, upper=True)
+        
+        # 生成非结构化掩码
+        for i1 in range(0, self.columns, blocksize):
+            i2 = min(i1 + blocksize, self.columns)
+            W1 = W[:, i1:i2].clone()
+            Hinv1 = Hinv[i1:i2, i1:i2]
+            
+            # OBS剪枝核心逻辑
+            tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
+            thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
+            mask1 = tmp <= thresh
+            
+            # 应用剪枝
+            W1[mask1] = 0
+            W[:, i1:i2] = W1
+        
+        # 生成最终掩码
+        unstructured_mask = (W != 0).float()
+        
+        # 恢复原始权重
+        self.layer.weight.data = W_orig
+        return unstructured_mask
+
     def fasterprune(
         self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01, sparsity_way="origin"
     ):
@@ -87,21 +128,14 @@ class SparseGPT:
 
         mask = None
 
-
-        # ---- 新增代码：生成非结构化50%掩码 ----
         with torch.no_grad():
-            # 计算全局非结构化掩码
-            W_flat = W.flatten()
-            thresh = torch.sort(torch.abs(W_flat))[0][int(W_flat.numel() * 0.5)]
-            unstructured_mask = (torch.abs(W) >= thresh).float()  # 1=保留, 0=剪枝
+            unstructured_mask = self.unstructured_prune(sparsity=0.5)
             # 保存为块状列表，便于后续匹配
             block_unstructured_masks = []
             for i1 in range(0, self.columns, blocksize):
                 i2 = min(i1 + blocksize, self.columns)
                 block_mask = unstructured_mask[:, i1:i2]
                 block_unstructured_masks.append(block_mask)
-        # -------------------------------------
-
 
         def get_block_sensitivity(W_block, Hinv_block, unstructured_submask=None):
             """敏感度 = 原始敏感度 + 非结构化掩码保留点增益"""
@@ -109,8 +143,8 @@ class SparseGPT:
             # 计算该子块内非结构化掩码保留的比例
             mask_coverage = torch.sum(unstructured_submask) / unstructured_submask.numel()
             # 增强敏感度：覆盖度越高，该块重要性越大
-            enhanced_salience = base_salience * (1 + 2 * mask_coverage)  # 假设覆盖度每增加10%，敏感度提升20%
-            return enhanced_salience
+            enhanced_salience = mask_coverage
+            return 0.5*base_salience + 0.5*enhanced_salience
 
         # ===== 动态N:M分配 =====
         def assign_nm_pattern(salience_list, M=8):
@@ -118,13 +152,16 @@ class SparseGPT:
             sorted_indices = torch.argsort(torch.tensor(salience_list), descending=True)
             n_values = []
             if sparsity<=0.4:
-                four_eight = 0.25
+                four_eight = 0.2
             elif sparsity<=0.6:
                 four_eight = 0.55
             else:
-                four_eight = 0.4
+                four_eight = 0.3
+            # sparsity = 0.5
+            # four_eight = 0.3
             three_eight = 2.5 - 0.5*four_eight - 4*sparsity
             five_eight = 1 - three_eight - four_eight
+            
             for idx in sorted_indices:
                 if idx < len(salience_list)*three_eight:
                     n_values.append(3)
@@ -152,8 +189,7 @@ class SparseGPT:
                 Hinv_sub = Hinv1[sub_i:sub_i+8, sub_i:sub_i+8]
                 all_saliences.append(get_block_sensitivity(sub_block, Hinv_sub, submask))
                 block_Hinvs.append(Hinv_sub)
-        
-        # 分配N值（3:8/4:8/5:8）            
+                   
         n_values = assign_nm_pattern(all_saliences)
         #print(f"n_values: {n_values}")
         
@@ -229,6 +265,28 @@ class SparseGPT:
         torch.cuda.synchronize()
         print('time %.2f' % (time.time() - tick))
         print('error', torch.sum(Losses).item())
+
+        # 生成最终剪枝掩码
+        pruned_mask = (W != 0).float()
+        # 计算覆盖率指标
+        def compute_mask_similarity(original_mask, new_mask):
+            intersection = torch.sum(original_mask * new_mask)
+            original_nonzero = torch.sum(original_mask)
+            coverage_ratio = intersection / original_nonzero
+            
+            print(f"覆盖率（重叠/原始）: {coverage_ratio.item()*100:.2f}%")
+            # print(f"新掩码非零元素数: {torch.sum(new_mask).item()}")
+            # print(f"重叠非零元素数: {intersection.item()}")
+            # print(f"覆盖率（重叠/原始）: {coverage_ratio.item()*100:.2f}%")
+            # print(f"Jaccard相似系数: {intersection/(original_nonzero + torch.sum(new_mask) - intersection):.4f}")
+            
+            return coverage_ratio
+
+        # 执行计算（需要保持mask维度一致）
+        if unstructured_mask.shape == pruned_mask.shape:
+            compute_mask_similarity(unstructured_mask, pruned_mask)
+        else:
+            print("[警告] 掩码维度不匹配，无法计算覆盖率")
 
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
