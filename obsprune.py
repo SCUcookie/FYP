@@ -92,9 +92,41 @@ class SparseGPT:
         self.layer.weight.data = W_orig
         return unstructured_mask
 
+    def magnitude_prune(self):
+        """4:8结构化剪枝（每个8元素块保留4个最大绝对值权重）"""
+        W = self.layer.weight.data.clone().float()
+        original_shape = W.shape
+        
+        # 重塑为 [rows, cols//8, 8]
+        if W.shape[1] % 8 != 0:
+            # 填充列维度为8的倍数
+            pad_size = 8 - (W.shape[1] % 8)
+            W = torch.nn.functional.pad(W, (0, pad_size), mode='constant', value=0)
+        
+        W_blocks = W.view(W.shape[0], -1, 8)  # [rows, num_blocks, 8]
+        
+        # 计算每个块内绝对值排序
+        abs_vals = torch.abs(W_blocks)
+        _, topk_indices = torch.topk(abs_vals, k=4, dim=-1)  # 取每个块前4大
+        
+        # 生成4:8稀疏掩码
+        mask = torch.zeros_like(W_blocks, dtype=torch.bool)
+        mask.scatter_(-1, topk_indices, True)
+        
+        # 恢复原始形状（包含padding部分）
+        mask = mask.view(W.shape)
+        if original_shape[1] != W.shape[1]:
+            mask = mask[:, :original_shape[1]]  # 去除padding部分
+        
+        # 应用剪枝
+        self.layer.weight.data *= mask.float()
+        return mask
+
     def fasterprune(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01, sparsity_way="origin"
+        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01, sparsity_way="origin", method="obs"
     ):
+        if method == "magnitude":
+            return self.magnitude_prune()
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
@@ -192,8 +224,7 @@ class SparseGPT:
                    
         n_values = assign_nm_pattern(all_saliences)
         #print(f"n_values: {n_values}")
-        
-
+        #prunen, prunem = 0, 0
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -231,7 +262,7 @@ class SparseGPT:
 
                 if prunen != 0 and i % prunem == 0:    #n:m的半结构裁剪
                     tmp = W1[:, i:(i + prunem)] ** 2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1))) ** 2
-                    mask1.scatter_(1, i + torch.topk(tmp, n_values[block_idx], dim=1, largest=False)[1], True)
+                    mask1.scatter_(1, i + torch.topk(tmp, 4, dim=1, largest=False)[1], True)
                     block_idx+=1
 
                 q = w.clone()
