@@ -5,16 +5,21 @@
 ## Usage
 
 Below is the command for running pruning by using opt model:
+run the prune.py: 
 ```sh
-run the prune.py: python prune.py --model opt/125m --dataset c4 --sparsity .5 --sparsity_way weight-level(layer-level)
+python prune.py --model opt/125m --dataset c4 --sparsity .5 --sparsity_way weight-level(layer-level)
 ```
 For llama model:
+
+run the llama.py: 
 ```sh
-run the prune.py: python llama.py --model model/llama-7b --dataset c4 --sparsity.5 --sparsity_way weight-level(layer-level)
+python llama.py --model model/llama-7b --dataset c4 --sparsity.5 --sparsity_way weight-level(layer-level)
 ```
 For llama2 model:
+
+run the llama.py: 
 ```sh
-run the prune.py: python llama.py --model model/llama-2-7b-hf --dataset c4 --sparsity.5 --sparsity_way weight-level(layer-level)
+python llama.py --model model/llama-2-7b-hf --dataset c4 --sparsity.5 --sparsity_way weight-level(layer-level)
 ```
 ## Zero-shot Evaluation
 
